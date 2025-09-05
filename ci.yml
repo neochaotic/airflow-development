@@ -1,0 +1,36 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-checks:
+    name: Code Quality and DAG Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Create .env file for CI
+        run: |
+          echo "GCP_PROJECT_ID=ci-project" > .env
+          echo "LOCAL_GCLOUD_CONFIG_DIR_PATH=/tmp/gcloud" >> .env
+          echo "AIRFLOW_UID=$(id -u)" >> .env
+          mkdir -p /tmp/gcloud && echo '{}' > /tmp/gcloud/application_default_credentials.json
+
+      - name: Run linting checks in Docker
+        run: make lint
+
+      - name: Run DAG integrity tests in Docker (CI mode)
+        run: make test-ci

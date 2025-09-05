@@ -1,0 +1,6 @@
+# Development and Testing Dependencies
+black
+flake8
+pre-commit
+pytest
+pytest-cov
