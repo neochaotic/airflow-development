@@ -1,0 +1,2 @@
+# Core Python Dependencies
+apache-airflow-providers-google==10.15.0

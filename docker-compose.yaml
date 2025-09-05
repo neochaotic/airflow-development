@@ -1,0 +1,238 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# ... (cabeçalho ASF)
+
+# ####################################################################################
+# WARNING: This configuration is for local development and is NOT SUITABLE for production.
+# ####################################################################################
+x-airflow-common:
+  &airflow-common
+  build: # BUILDS the image from the local Dockerfile
+    context: .
+    dockerfile: Dockerfile 
+    args:
+      AIRFLOW_VERSION: 2.11.0
+      PYTHON_VERSION_TAG: 3.11 # Matches the FROM in the Dockerfile
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: '' 
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false' 
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/gcloud-config/application_default_credentials.json
+    CLOUDSDK_CONFIG: /opt/airflow/gcloud-config # Points to the mounted gcloud config directory
+    GOOGLE_CLOUD_PROJECT: "${GCP_PROJECT_ID:?ERROR: GCP_PROJECT_ID is not set in the .env file. Please see README.md}"
+    _PIP_ADDITIONAL_REQUIREMENTS: '' # Python packages are now part of the built image via requirements.txt
+    _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+    _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/pytest.ini:/opt/airflow/pytest.ini
+    - ${AIRFLOW_PROJ_DIR:-.}/tests:/opt/airflow/tests
+    - "${LOCAL_GCLOUD_CONFIG_DIR_PATH:?ERROR: The LOCAL_GCLOUD_CONFIG_DIR_PATH variable is not set or is empty in the .env file.}:/opt/airflow/gcloud-config:ro" 
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}" 
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on: 
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common 
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "Running airflow-init script..."
+        
+        if [[ -z "${AIRFLOW_UID}" ]]; then 
+            echo; echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+            echo "If you are on Linux, you may need to set AIRFLOW_UID in your .env file to your current user's UID to avoid permission issues."
+            echo "For other operating systems you can get rid of the warning with manually created .env file:"
+            echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
+            echo
+        fi
+        
+        echo "Creating host-mounted directories (logs, dags, plugins, tests) if they do not exist..."
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/tests
+        
+        EFFECTIVE_UID=$${AIRFLOW_UID:-$$(id -u):-50000}
+        EFFECTIVE_GID=$${AIRFLOW_GID:-0} 
+
+        if [[ -n "$${EFFECTIVE_UID}" ]]; then
+            echo "Setting ownership for /sources subdirectories to UID=$${EFFECTIVE_UID} GID=$${EFFECTIVE_GID}..."
+            chown -R "$${EFFECTIVE_UID}:$${EFFECTIVE_GID}" /sources/{logs,dags,plugins,tests}
+        else
+            echo "\033[1;33mWARNING: Could not determine UID/GID for chown on /sources.\e[0m"
+        fi
+        
+        echo "Executing original entrypoint to handle DB migration and user creation..."
+        # The entrypoint will use _AIRFLOW_DB_MIGRATE and _AIRFLOW_WWW_USER_CREATE.
+        # _PIP_ADDITIONAL_REQUIREMENTS is empty as packages are installed via Dockerfile.
+        exec /entrypoint bash -c "set -e; \
+                                 echo '[init] Entrypoint basic setup (DB, User) complete.'; \
+                                 echo '[init] Ensuring BigQuery default connection is correctly configured...'; \
+                                 (airflow connections delete 'bigquery_default' &>/dev/null) || true; \
+                                 airflow connections add 'bigquery_default' --conn-type 'google_cloud' --conn-extra '{\"extra__google_cloud__project\": \"${GCP_PROJECT_ID:?ERROR: GCP_PROJECT_ID is not set in the .env file. Please see README.md}\"}'; \
+                                 echo '[init] BigQuery default connection configured successfully.'; \
+                                 echo '[init] >>> Airflow init process complete. Airflow version:'; \
+                                 airflow version"
+    environment:
+      <<: *airflow-common-env 
+      _AIRFLOW_DB_MIGRATE: 'true' 
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _PIP_ADDITIONAL_REQUIREMENTS: '' # Packages are built into the image
+    user: "0:0" 
+    volumes: 
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+      # The /opt/airflow/* mounts are inherited from x-airflow-common
+      # and are used by the entrypoint and airflow commands.
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles: ["debug"] 
+    entrypoint: "" # Override the default entrypoint to make this a generic utility container
+    environment:
+      <<: *airflow-common-env # Inherits _PIP_ADDITIONAL_REQUIREMENTS=''
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  ci-test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test # Use the dedicated test Dockerfile
+    environment:
+      # Minimal environment for tests to run, including GCP config
+      # This avoids dependencies on postgres/redis for simple DAG validation.
+      <<: *airflow-common-env
+    profiles: ["donotstart"] # Prevents this service from starting with `make up`
+    # No volumes are needed for dags/plugins/tests as they are copied into the image.
+    entrypoint: "" # Make it a generic runner
+    command: ["sleep", "infinity"] # Default command to keep it alive if needed, but we will override it.
+
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    profiles: ["flower"] # To enable, run: docker-compose up --profile flower
+    ports: ["5555:5555"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
